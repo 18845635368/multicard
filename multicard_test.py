@@ -1,20 +1,17 @@
 '''
-Pytorch分布式训练脚本，需要安装pytorch。
+deepfake detection multicard 
 
-@author zz
-@date 2020.3.31
+@author hzm
+@date 2021.12.1
 '''
 
 import os
-import subprocess
+
 from datetime import datetime
 import argparse
 
-from cv2 import ellipse2Poly
-from torch._C import device
 from isplutils.data import FrameFaceIterableDataset, load_face, FrameFaceDataset
 import torch.multiprocessing as mp
-import torchvision
 import torchvision.transforms as transforms
 import torch
 import torch.nn as nn
