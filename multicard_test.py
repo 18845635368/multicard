@@ -12,7 +12,7 @@ import argparse
 
 from cv2 import stereoCalibrate
 
-from isplutils.data import FrameFaceIterableDataset, load_face, FrameFaceDataset
+from isplutils.data import FrameFaceIterableDataset, FrameFaceDataset
 import torch.multiprocessing as mp
 import torchvision.transforms as transforms
 import torch
@@ -29,6 +29,7 @@ from tensorboardX import SummaryWriter
 import numpy as np
 from sklearn.metrics import f1_score, roc_auc_score
 
+from config import config
 
 ###################
 # 分布式训练
@@ -64,11 +65,11 @@ def dist_train(gpu, args):
 
     # !step 2
     # *将args获取的参数转化为变量
+
     train_datasets = args.traindb
     val_datasets = args.valdb
-    dfdc_df_path = args.dfdc_faces_df_path
+    mode = args.mode
     ffpp_df_path = args.ffpp_faces_df_path
-    dfdc_faces_dir = args.dfdc_faces_dir
     ffpp_faces_dir = args.ffpp_faces_dir
     face_policy = args.face
     face_size = args.size
@@ -76,15 +77,15 @@ def dist_train(gpu, args):
     initial_lr = args.lr
     validation_interval = args.valint
     patience = args.patience
-    initial_model = args.init
+
     train_from_scratch = args.scratch
     # ?max_train_samples = args.trainsamples
-    max_val_samples = args.valsamples
     log_interval = args.logint
     num_workers = args.workers
     seed = args.seed
     debug = args.debug
-    suffix = args.suffix
+    valsamples = args.valsamples
+
     # ?enable_attention = args.attention
     weights_folder = args.models_dir
     logs_folder = args.log_dir
@@ -93,6 +94,12 @@ def dist_train(gpu, args):
     init_method = args.init_method
     epoch_run = args.epochs
     model_period = args.modelperiod
+
+    # 暂时没用
+    dfdc_df_path = args.dfdc_faces_df_path
+    dfdc_faces_dir = args.dfdc_faces_dir
+    initial_model = args.index
+    # suffix = args.suffix
 
     # *初始化进程组，决定进程的通信方式，自己的进程标志
     dist.init_process_group(
@@ -146,7 +153,7 @@ def dist_train(gpu, args):
 
     # *对模型进行加载
     # TODO 编写模型加载模块
-    mode = 1
+
     load_model(model, optimizer, path_list, mode, initial_model)
 
     print(epoch)
@@ -212,7 +219,7 @@ def dist_train(gpu, args):
     val_dataset = FrameFaceIterableDataset(roots=val_roots,
                                            dfs=val_dfs,
                                            scale=face_policy,
-                                           num_samples=max_val_samples,
+                                           num_samples=valsamples,
                                            transformer=transformer,
                                            size=face_size,
                                            )
@@ -231,10 +238,10 @@ def dist_train(gpu, args):
 
     # *将数据集提供给sampler
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
-                                                                    num_replicas=args.world_size,
+                                                                    num_replicas=world_size,
                                                                     rank=rank)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset,
-                                                                  num_replicas=args.world_size,
+                                                                  num_replicas=world_size,
                                                                   rank=rank)
 
     # *生成Dataloader
@@ -302,11 +309,7 @@ def dist_train(gpu, args):
 
             # *对模型进行验证
             if iteration > 0 and (iteration % validation_interval == 0):
-                # Model checkpoint
-                # save_model(model, optimizer, train_loss, val_loss, iteration, batch_size, epoch,
-                #            periodic_path.format(iteration))
 
-                # Train cumulative stats
                 train_labels = np.concatenate(train_labels_list)
                 train_pred = np.concatenate(train_pred_list)
                 train_labels_list = []
@@ -319,13 +322,14 @@ def dist_train(gpu, args):
                 tb.add_pr_curve('train/pr', train_labels,
                                 train_pred, iteration)
 
-                # Validation
+                # *Validation
+                # *将会在卡1 上进行模型验证
                 device = 1
                 val_loss = validation_routine(
                     model, val_loader, criterion, tb, iteration, 'val')
                 tb.flush()
 
-                # LR Scheduler
+                # *根据loss调整
                 lr_scheduler.step(val_loss)
 
                 # Model checkpoint
@@ -376,34 +380,6 @@ def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch
 
 def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: str, mode: int, index: int):
     print("start loading model")
-    # # *选定某个model作为特定的其实训练model
-    # if initial_model is not None:
-    #     print('Loading model form: {}'.format(initial_model))
-    #     state = torch.load(initial_model, map_location='cpu')
-    #     model_state = state['model']
-    # # *接着上次的训练继续训练
-    # elif not args.scratch and os.path.exists(last_path):
-    #     print('Loading model form: {}'.format(last_path))
-    #     state = torch.load(last_path, map_location='cpu')
-    #     model_state = state['model']
-    #     opt_state = state['opt']
-    #     iteration = state['iteration'] + 1
-    #     epoch = state['epoch']
-    # # *接着最棒的model进行训练
-    # if not args.scratch and os.path.exists(bestval_path):
-    #     state = torch.load(bestval_path, map_location='cpu')
-    #     min_val_loss = state['val_loss']
-
-    # # *开始将参数载入model
-    # if model_state is not None:
-    #     incomp_keys = model.load_state_dict(
-    #         {k.replace('module.', ''): v for k, v in model_state})
-    #     # incomp_keys = model.load_state_dict(model_state, strict=False)
-    #     print(incomp_keys)
-    # if opt_state is not None:
-    #     # for param_group in opt_state['param_groups']:
-    #     #     param_group['lr'] = args.lr
-    #     optimizer.load_state_dict(opt_state)
 
     if mode == 1 and os.path.exists(path_list[0]):
         print("载入最优模型")
@@ -416,14 +392,16 @@ def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: st
         print("载入最新模型")
         incomp_keys = model.load_state_dict(
             {k.replace('module.', ''): v for k, v in torch.load(path_list[1])['model'].items()})
-    else:
-        print("载入模型{06d}".format(index))
+    elif mode == 3:
+        print("载入模型{:06d}".format(index))
         if(os.path.exists(path_list[2].format(index))):
             incomp_keys = model.load_state_dict(
                 {k.replace('module.', ''): v for k, v in torch.load(path_list[2].format(index))['model'].items()})
         else:
             raise RuntimeError(
                 'Wrong index for preloaded model')
+    else:
+        return
 
     print(incomp_keys)
 
@@ -539,84 +517,9 @@ def validation_routine(net, val_loader, criterion, tb, iteration, tag: str, load
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-g', '--gpus', default=2, type=int,
-                        help='number of gpus per node')  # gpu总数量
-    parser.add_argument('--epochs', default=30, type=int,
-                        metavar='N', help='number of total epochs to run')
-    parser.add_argument('--backend', default='nccl', type=str,
-                        help='backend used for distributed train')
-    parser.add_argument('--syncbn', default=False, action="store_true",
-                        help='whether to use syncbn while training')
-    parser.add_argument('--net', type=str,
-                        help='Net model class', default="EfficientNetB4")
 
-    parser.add_argument('--traindb', type=str, help='Training datasets', nargs='+', choices=split.available_datasets,
-                        required=True)
-    parser.add_argument('--valdb', type=str, help='Validation datasets', nargs='+', choices=split.available_datasets,
-                        required=True)
-
-    parser.add_argument('--ffpp_faces_df_path', type=str, action='store',
-                        help='Path to the Pandas Dataframe obtained from extract_faces.py on the FF++ dataset. '
-                             'Required for training/validating on the FF++ dataset.', default="/mnt/8T/FFPP/df/output/FFPP_df.pkl")
-    parser.add_argument('--ffpp_faces_dir', type=str, action='store',
-                        help='Path to the directory containing the faces extracted from the FF++ dataset. '
-                             'Required for training/validating on the FF++ dataset.', default="/mnt/8T/FFPP/faces/output")
-
-    parser.add_argument('--dfdc_faces_df_path', type=str, action='store',
-                        help='Path to the Pandas Dataframe obtained from extract_faces.py on the DFDC dataset. '
-                             'Required for training/validating on the DFDC dataset.')
-    parser.add_argument('--dfdc_faces_dir', type=str, action='store',
-                        help='Path to the directory containing the faces extracted from the DFDC dataset. '
-                             'Required for training/validating on the DFDC dataset.')
-
-    parser.add_argument('--face', type=str, help='Face crop or scale',
-                        choices=['scale', 'tight'], default='scale')
-    parser.add_argument('--size', type=int,
-                        help='Train patch size', default=224)
-    parser.add_argument('--batch', type=int,
-                        help='Batch size to fit in GPU memory', default=64)
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--valint', type=int,
-                        help='Validation interval (iterations)', default=100)
-    parser.add_argument('--logint', type=int,
-                        help='Training log interval (iterations)', default=100)
-    parser.add_argument('--modelperiod', type=int,
-                        help='model save period (iterations)', default=500)
-    parser.add_argument('--patience', type=int, help='Patience before dropping the LR [validation intervals]',
-                        default=10)
-    # parser.add_argument('--maxiter', type=int,
-    #                     help='Maximum number of iterations', default=20000)
-    parser.add_argument('--init', type=str,
-                        help='Weight initialization file', default=0)
-    parser.add_argument('--scratch', action='store_true',
-                        help='Train from scratch')
-
-    # parser.add_argument('--trainsamples', type=int,
-    #                     help='Limit the number of train samples per epoch', default=-1)
-    parser.add_argument('--valsamples', type=int, help='Limit the number of validation samples per epoch',
-                        default=6000)
-
-    parser.add_argument('--workers', type=int,
-                        help='Num workers for data loaders', default=4)
-    # parser.add_argument('--device', type=int, help='GPU device id', default=0)
-    parser.add_argument('--seed', type=int, help='Random seed', default=3)
-
-    parser.add_argument('--debug', action='store_true', help='Activate debug')
-    parser.add_argument('--suffix', type=str, help='Suffix to default tag')
-
-    parser.add_argument('--attention', action='store_true',
-                        help='Enable Tensorboard log of attention masks')
-    parser.add_argument('--log_dir', type=str, help='Directory for saving the training logs',
-                        default='/mnt/8T/multicard/runs/binclass/')
-    parser.add_argument('--models_dir', type=str, help='Directory for saving the models weights',
-                        default='/mnt/8T/multicard/weights/binclass/')
-
-    args = parser.parse_args()
-
-    args.world_size = args.gpus  # 进程总数
-    args.init_method = 'tcp://10.249.178.201:34567'
-    mp.spawn(dist_train, nprocs=args.gpus, args=(args,))
+    args = config.config_test()
+    mp.spawn(dist_train,  nprocs=args.gpus, args=(args,))
 
 
 if __name__ == '__main__':
