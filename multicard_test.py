@@ -28,28 +28,6 @@ import numpy as np
 from sklearn.metrics import f1_score, roc_auc_score
 
 
-class ConvNet(nn.Module):
-    def __init__(self, num_classes=10):
-        super(ConvNet, self).__init__()
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(16),            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2))
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2))
-        self.fc = nn.Linear(7*7*32, num_classes)
-
-    def forward(self, x):
-        out = self.layer1(x)
-        out = self.layer2(out)
-        out = out.reshape(out.size(0), -1)
-        out = self.fc(out)
-        return out
-
-
 ###################
 # 分布式训练
 ###################
@@ -63,10 +41,17 @@ class ConvNet(nn.Module):
 :step 2     进行初始参数配置  
 :step 3     设置优化器和学习率调节器
 :step 4     模型加载
-:step 5     将模型载入到DDP中
+:step 5     加载图片载入要用的transform
 :step 6     数据集处理
 :step 7     初始化tensorboard
 :step 8     开始训练
+'''
+# Todo
+'''
+1.训练的模型再次载入报错                                           fix： 2021.12.2  15:05
+2.再次载入后，在优化器的step阶段，变量不在一个tensor上，有些在cpu上   fix：2021.12.2  15:05
+3.config类的编写
+
 '''
 
 
@@ -157,11 +142,14 @@ def dist_train(gpu, args):
     opt_state = None
 
     # *对模型进行加载
+
+    # *选定某个model作为特定的其实训练model
     if initial_model is not None:
-        # If given load initial model
+
         print('Loading model form: {}'.format(initial_model))
         state = torch.load(initial_model, map_location='cpu')
         model_state = state['model']
+    # *接着上次的训练继续训练
     elif not args.scratch and os.path.exists(last_path):
         print('Loading model form: {}'.format(last_path))
         state = torch.load(last_path, map_location='cpu')
@@ -169,9 +157,12 @@ def dist_train(gpu, args):
         opt_state = state['opt']
         iteration = state['iteration'] + 1
         epoch = state['epoch']
+    # *接着最棒的model进行训练
     if not args.scratch and os.path.exists(bestval_path):
         state = torch.load(bestval_path, map_location='cpu')
         min_val_loss = state['val_loss']
+
+    # *开始将参数载入model
     if model_state is not None:
         incomp_keys = model.load_state_dict(model_state, strict=False)
         print(incomp_keys)
@@ -181,18 +172,28 @@ def dist_train(gpu, args):
         optimizer.load_state_dict(opt_state)
     print(epoch)
 
+    model = model.cuda(gpu)
+
+    model = nn.parallel.DistributedDataParallel(
+        model, device_ids=[gpu])
+
+    # 将所有optimizer的数据放回到cuda上
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.cuda(gpu)
+
+    # !step5
+    # *生成数据增强用到的transform
+
+    model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+
     # *同步batch归一化
     if args.syncbn:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
         if gpu == 0:
             print('Use SyncBN in training')
     torch.cuda.set_device(gpu)
-    model.cuda(gpu)
-
-    # !step5
-    # *生成数据增强用到的transform
-
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     # !step6
 
@@ -312,9 +313,11 @@ def dist_train(gpu, args):
                 tb.add_scalar('epoch', epoch, iteration)
 
                 # *500个batch，会保存一次model
-                if iteration % model_period == 0:
-                    save_model(model, optimizer, train_loss, val_loss,
-                               iteration, batch_size, epoch, last_path)
+                if (iteration % model_period == 0):
+                    save_model_v2(model, optimizer, train_loss, val_loss,
+                                  iteration, batch_size, epoch, periodic_path.format(iteration))
+                    save_model_v2(model, optimizer, train_loss, val_loss,
+                                  iteration, batch_size, epoch, last_path)
 
                 train_loss = train_num = 0
 
@@ -349,8 +352,8 @@ def dist_train(gpu, args):
                 # Model checkpoint
                 if val_loss < min_val_loss:
                     min_val_loss = val_loss
-                    save_model(model, optimizer, train_loss, val_loss,
-                               iteration, batch_size, epoch, bestval_path)
+                    save_model_v2(model, optimizer, train_loss, val_loss,
+                                  iteration, batch_size, epoch, bestval_path)
             # *每迭代一个batch +1
             iteration = iteration + 1
         epoch = epoch + 1
@@ -370,7 +373,7 @@ method definition:
 '''
 
 
-def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch.Tensor) -> (torch.Tensor, float, int):
+def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch.Tensor):
     data = data.cuda(non_blocking=True)
     labels = labels.cuda(non_blocking=True)
     outputs = model(data)
@@ -394,6 +397,28 @@ method definition :用于将训练过程中得到weight进行保存
 :param path         以上所有数据的存储路径
 ------------------
 '''
+
+
+def save_model_v2(model: nn.Module, optimizer: torch.optim.Optimizer,
+                  train_loss: float, val_loss: float,
+                  iteration: int, batch_size: int, epoch: int,
+                  path: str):
+    path = str(path)
+    model_state_dict = model.state_dict()
+    # optimizer_state_dict =optimizer.state_dict()
+    for key in model_state_dict.keys():
+        model_state_dict[key] = model_state_dict[key].cpu()
+
+    # for key in optimizer.:
+    #     optimizer_state_dict[key] = optimizer_state_dict[key].cpu()
+    state = dict(model=model_state_dict,
+                 opt=optimizer.state_dict(),
+                 train_loss=train_loss,
+                 val_loss=val_loss,
+                 iteration=iteration,
+                 batch_size=batch_size,
+                 epoch=epoch)
+    torch.save(state, path)
 
 
 def save_model(model: nn.Module, optimizer: torch.optim.Optimizer,
@@ -510,7 +535,7 @@ def main():
     parser.add_argument('--logint', type=int,
                         help='Training log interval (iterations)', default=100)
     parser.add_argument('--modelperiod', type=int,
-                        help='model save period (iterations)', default=500)
+                        help='model save period (iterations)', default=50)
     parser.add_argument('--patience', type=int, help='Patience before dropping the LR [validation intervals]',
                         default=10)
     # parser.add_argument('--maxiter', type=int,
@@ -527,7 +552,7 @@ def main():
     parser.add_argument('--workers', type=int,
                         help='Num workers for data loaders', default=4)
     # parser.add_argument('--device', type=int, help='GPU device id', default=0)
-    parser.add_argument('--seed', type=int, help='Random seed', default=1)
+    parser.add_argument('--seed', type=int, help='Random seed', default=3)
 
     parser.add_argument('--debug', action='store_true', help='Activate debug')
     parser.add_argument('--suffix', type=str, help='Suffix to default tag')
