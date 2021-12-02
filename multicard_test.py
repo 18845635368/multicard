@@ -10,6 +10,8 @@ import os
 from datetime import datetime
 import argparse
 
+from cv2 import stereoCalibrate
+
 from isplutils.data import FrameFaceIterableDataset, load_face, FrameFaceDataset
 import torch.multiprocessing as mp
 import torchvision.transforms as transforms
@@ -51,7 +53,7 @@ from sklearn.metrics import f1_score, roc_auc_score
 1.训练的模型再次载入报错                                           fix： 2021.12.2  15:05
 2.再次载入后，在优化器的step阶段，变量不在一个tensor上，有些在cpu上   fix：2021.12.2  15:05
 3.config类的编写
-4
+4.保存模型的载入有问题，其实是ddp的保存方式导致最终的保存模型在dict上名字对不上     fix：2021.12.2 19:40
 '''
 
 
@@ -118,6 +120,7 @@ def dist_train(gpu, args):
     bestval_path = os.path.join(weights_folder, tag, 'bestval.pth')
     last_path = os.path.join(weights_folder, tag, 'last.pth')
     periodic_path = os.path.join(weights_folder, tag, 'it{:06d}.pth')
+    path_list = [bestval_path, last_path, periodic_path]
     os.makedirs(os.path.join(weights_folder, tag), exist_ok=True)
 
     # !step3
@@ -142,34 +145,10 @@ def dist_train(gpu, args):
     opt_state = None
 
     # *对模型进行加载
+    # TODO 编写模型加载模块
+    mode = 1
+    load_model(model, optimizer, path_list, mode, initial_model)
 
-    # *选定某个model作为特定的其实训练model
-    if initial_model is not None:
-
-        print('Loading model form: {}'.format(initial_model))
-        state = torch.load(initial_model, map_location='cpu')
-        model_state = state['model']
-    # *接着上次的训练继续训练
-    elif not args.scratch and os.path.exists(last_path):
-        print('Loading model form: {}'.format(last_path))
-        state = torch.load(last_path, map_location='cpu')
-        model_state = state['model']
-        opt_state = state['opt']
-        iteration = state['iteration'] + 1
-        epoch = state['epoch']
-    # *接着最棒的model进行训练
-    if not args.scratch and os.path.exists(bestval_path):
-        state = torch.load(bestval_path, map_location='cpu')
-        min_val_loss = state['val_loss']
-
-    # *开始将参数载入model
-    if model_state is not None:
-        incomp_keys = model.load_state_dict(model_state, strict=False)
-        print(incomp_keys)
-    if opt_state is not None:
-        for param_group in opt_state['param_groups']:
-            param_group['lr'] = args.lr
-        optimizer.load_state_dict(opt_state)
     print(epoch)
 
     model = model.cuda(gpu)
@@ -385,6 +364,74 @@ def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch
 
 
 '''
+:method definition : DDP专用的模型加载方式
+---------------------
+:param model        需要被加载的模型
+:param optimizer    需要被加载的优化器
+:param path_list    保存的模型的路径[]
+:param mode         选择的加载方式[1:加载训练最优的模型，2：加载最新的模型，3：加载制定模型]
+:param index        制定模型的编号
+'''
+
+
+def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: str, mode: int, index: int):
+    print("start loading model")
+    # # *选定某个model作为特定的其实训练model
+    # if initial_model is not None:
+    #     print('Loading model form: {}'.format(initial_model))
+    #     state = torch.load(initial_model, map_location='cpu')
+    #     model_state = state['model']
+    # # *接着上次的训练继续训练
+    # elif not args.scratch and os.path.exists(last_path):
+    #     print('Loading model form: {}'.format(last_path))
+    #     state = torch.load(last_path, map_location='cpu')
+    #     model_state = state['model']
+    #     opt_state = state['opt']
+    #     iteration = state['iteration'] + 1
+    #     epoch = state['epoch']
+    # # *接着最棒的model进行训练
+    # if not args.scratch and os.path.exists(bestval_path):
+    #     state = torch.load(bestval_path, map_location='cpu')
+    #     min_val_loss = state['val_loss']
+
+    # # *开始将参数载入model
+    # if model_state is not None:
+    #     incomp_keys = model.load_state_dict(
+    #         {k.replace('module.', ''): v for k, v in model_state})
+    #     # incomp_keys = model.load_state_dict(model_state, strict=False)
+    #     print(incomp_keys)
+    # if opt_state is not None:
+    #     # for param_group in opt_state['param_groups']:
+    #     #     param_group['lr'] = args.lr
+    #     optimizer.load_state_dict(opt_state)
+
+    if mode == 1 and os.path.exists(path_list[0]):
+        print("载入最优模型")
+        # *现在入model
+        incomp_keys = model.load_state_dict(
+            {k.replace('module.', ''): v for k, v in torch.load(path_list[0])['model'].items()})
+        # *再载入optim
+
+    elif mode == 2 and os.path.exists(path_list[1]):
+        print("载入最新模型")
+        incomp_keys = model.load_state_dict(
+            {k.replace('module.', ''): v for k, v in torch.load(path_list[1])['model'].items()})
+    else:
+        print("载入模型{06d}".format(index))
+        if(os.path.exists(path_list[2].format(index))):
+            incomp_keys = model.load_state_dict(
+                {k.replace('module.', ''): v for k, v in torch.load(path_list[2].format(index))['model'].items()})
+        else:
+            raise RuntimeError(
+                'Wrong index for preloaded model')
+
+    print(incomp_keys)
+
+    opt_state = torch.load(path_list[0])['opt']
+    optimizer.load_state_dict(opt_state)
+
+
+'''
 method definition :用于将训练过程中得到weight进行保存 
 ------------------
 :param net[nn.Module]   过程中需要进行保存的model 
@@ -535,12 +582,13 @@ def main():
     parser.add_argument('--logint', type=int,
                         help='Training log interval (iterations)', default=100)
     parser.add_argument('--modelperiod', type=int,
-                        help='model save period (iterations)', default=50)
+                        help='model save period (iterations)', default=500)
     parser.add_argument('--patience', type=int, help='Patience before dropping the LR [validation intervals]',
                         default=10)
     # parser.add_argument('--maxiter', type=int,
     #                     help='Maximum number of iterations', default=20000)
-    parser.add_argument('--init', type=str, help='Weight initialization file')
+    parser.add_argument('--init', type=str,
+                        help='Weight initialization file', default=0)
     parser.add_argument('--scratch', action='store_true',
                         help='Train from scratch')
 

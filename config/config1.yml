@@ -1,5 +1,0 @@
-EfficientNet-B4:
-  gpus : 2
-  epochs : 50
-  backend : nccl
-  syncbn : False
