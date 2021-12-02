@@ -51,7 +51,7 @@ from sklearn.metrics import f1_score, roc_auc_score
 1.训练的模型再次载入报错                                           fix： 2021.12.2  15:05
 2.再次载入后，在优化器的step阶段，变量不在一个tensor上，有些在cpu上   fix：2021.12.2  15:05
 3.config类的编写
-
+4
 '''
 
 
