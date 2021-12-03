@@ -44,8 +44,8 @@ def config_test():
     # !模型加载配置
     config.scratch = False
     config.models_dir = '/mnt/8T/multicard/weights/binclass/'
-    # 1会加载最优模型，2会加载最新的模型，3会加载制定的模型
-    config.mode = 1
+    # 0会加载最优模型，1会加载最新的模型，2会加载制定的模型
+    config.mode = 0
     config.index = 0
     config.workers = 4
 

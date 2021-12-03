@@ -131,7 +131,7 @@ def dist_train(gpu, args):
     bestval_path = os.path.join(weights_folder, tag, 'bestval.pth')
     last_path = os.path.join(weights_folder, tag, 'last.pth')
     periodic_path = os.path.join(weights_folder, tag, 'it{:06d}.pth')
-    path_list = [bestval_path, last_path, periodic_path]
+    path_list = [bestval_path, last_path, periodic_path.format(initial_model)]
     os.makedirs(os.path.join(weights_folder, tag), exist_ok=True)
 
     # !step3
@@ -158,7 +158,8 @@ def dist_train(gpu, args):
     # *对模型进行加载
     # TODO 编写模型加载模块
 
-    load_model(model, optimizer, path_list, mode, initial_model)
+    epoch, iteration = load_model(model, optimizer, path_list, mode,
+                                  initial_model)
 
     print(epoch)
 
@@ -377,40 +378,49 @@ def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch
 :param model        需要被加载的模型
 :param optimizer    需要被加载的优化器
 :param path_list    保存的模型的路径[]
-:param mode         选择的加载方式[1:加载训练最优的模型，2：加载最新的模型，3：加载制定模型]
+:param mode         选择的加载方式[0:加载训练最优的模型，1：加载最新的模型，2：加载制定模型]
 :param index        制定模型的编号
 '''
+
+# TODO 维修现场
 
 
 def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: str, mode: int, index: int):
     print("start loading model")
-
-    if mode == 1 and os.path.exists(path_list[0]):
-        print("载入最优模型")
-        # *现在入model
-        incomp_keys = model.load_state_dict(
-            {k.replace('module.', ''): v for k, v in torch.load(path_list[0])['model'].items()})
-        # *再载入optim
-
-    elif mode == 2 and os.path.exists(path_list[1]):
-        print("载入最新模型")
-        incomp_keys = model.load_state_dict(
-            {k.replace('module.', ''): v for k, v in torch.load(path_list[1])['model'].items()})
-    elif mode == 3:
-        print("载入模型{:06d}".format(index))
-        if(os.path.exists(path_list[2].format(index))):
-            incomp_keys = model.load_state_dict(
-                {k.replace('module.', ''): v for k, v in torch.load(path_list[2].format(index))['model'].items()})
-        else:
-            raise RuntimeError(
-                'Wrong index for preloaded model')
-    else:
-        return
-
+    whole = torch.load(path_list[mode])
+    # *加载模型参数
+    incomp_keys = model.load_state_dict(
+        {k.replace('module.', ''): v for k, v in whole['model'].items()})
     print(incomp_keys)
-
-    opt_state = torch.load(path_list[0])['opt']
+    # *加载优化器参数
+    opt_state = whole['opt']
     optimizer.load_state_dict(opt_state)
+
+    # *加载其余参数
+    epoch = whole['epoch']
+    iteration = whole['iteration']
+    # 常规变量就直接返回出去
+    return epoch, iteration
+    # if mode == 1 and os.path.exists(path_list[0]):
+    #     print("载入最优模型")
+    #     # *现在入model
+    #     incomp_keys = model.load_state_dict(
+    #         {k.replace('module.', ''): v for k, v in torch.load(path_list[0])['model'].items()})
+
+    # elif mode == 2 and os.path.exists(path_list[1]):
+    #     print("载入最新模型")
+    #     incomp_keys = model.load_state_dict(
+    #         {k.replace('module.', ''): v for k, v in torch.load(path_list[1])['model'].items()})
+    # elif mode == 3:
+    #     print("载入模型{:06d}".format(index))
+    #     if(os.path.exists(path_list[2].format(index))):
+    #         incomp_keys = model.load_state_dict(
+    #             {k.replace('module.', ''): v for k, v in torch.load(path_list[2].format(index))['model'].items()})
+    #     else:
+    #         raise RuntimeError(
+    #             'Wrong index for preloaded model')
+    # else:
+    #     return
 
 
 '''
