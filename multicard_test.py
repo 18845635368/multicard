@@ -305,6 +305,10 @@ def dist_train(gpu, args):
 
                 # *500个batch，会保存一次model
                 if (iteration % model_period == 0):
+                    # *当Loss小于某个阈值，且达到周期时，选择震荡学习率，从而学习更优模型
+                    if train_loss < 0.04 and iteration > 10000:
+                        optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
+                            np.random.randint(0, 10)
                     save_model_v2(model, optimizer, train_loss, val_loss,
                                   iteration, batch_size, epoch, periodic_path.format(iteration))
                     save_model_v2(model, optimizer, train_loss, val_loss,
