@@ -300,9 +300,9 @@ def dist_train(gpu, args):
             optimizer.zero_grad()
 
             # *当达到周期时，选择震荡学习率，从而学习更优模型
-            if iteration > 10000 and iteration % vib_period == 0:
+            if iteration > 10000 and (iteration % vib_period) == 0:
                 optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
-                    np.random.randint(0, vib_factor)
+                    np.random.randint(2, vib_factor)
 
             # *记录训练阶段数据，保存模型
             if iteration > 0 and (iteration % log_interval == 0):
