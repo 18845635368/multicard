@@ -304,12 +304,17 @@ def dist_train(gpu, args):
                 optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
                     np.random.randint(0, vib_factor)
 
-            # *记录训练阶段数据，保存模型,制定由GPU0来完成此项任务
-            if iteration > 0 and (iteration % log_interval == 0) and gpu == 0:
+            # *记录训练阶段数据，保存模型
+            if iteration > 0 and (iteration % log_interval == 0):
                 train_loss /= train_num
+                train_labels = np.concatenate(train_labels_list)
+                train_pred = np.concatenate(train_pred_list)
+                train_roc_auc = roc_auc_score(train_labels, train_pred)
                 tb.add_scalar('train/loss', train_loss, iteration)
                 tb.add_scalar('lr', optimizer.param_groups[0]['lr'], iteration)
                 tb.add_scalar('epoch', epoch, iteration)
+                tb.add_scalar('train/roc_auc', train_roc_auc, iteration)
+                tb.flush()
 
                 # *500个batch，会保存一次model
                 if (iteration % model_period == 0):
@@ -320,21 +325,23 @@ def dist_train(gpu, args):
                                   iteration, batch_size, epoch, last_path)
 
                 train_loss = train_num = 0
+                train_labels_list = []
+                train_pred_list = []
 
             # *对模型进行验证
             if iteration > 0 and (iteration % validation_interval == 0):
 
-                train_labels = np.concatenate(train_labels_list)
-                train_pred = np.concatenate(train_pred_list)
-                train_labels_list = []
-                train_pred_list = []
+                # train_labels = np.concatenate(train_labels_list)
+                # train_pred = np.concatenate(train_pred_list)
+                # train_labels_list = []
+                # train_pred_list = []
 
-                train_roc_auc = roc_auc_score(train_labels, train_pred)
+                # train_roc_auc = roc_auc_score(train_labels, train_pred)
                 # train_f1 = f1_score(train_labels, train_pred)
                 # tb.add_scalar('train/f1', train_f1, iteration)
-                tb.add_scalar('train/roc_auc', train_roc_auc, iteration)
-                tb.add_pr_curve('train/pr', train_labels,
-                                train_pred, iteration)
+                # tb.add_scalar('train/roc_auc', train_roc_auc, iteration)
+                # tb.add_pr_curve('train/pr', train_labels,
+                #                 train_pred, iteration)
 
                 # *Validation
 
@@ -494,7 +501,7 @@ method definition:
 :param  criterion        损失函数
 :param  tb               tensorboard的实例化对象
 :param  iteration        当前迭代次数
-:param  tag              训练数据集名称，划分相应的一些信息
+:param  tag              给定了，就是"val"
 :param  loader_len_norm  每次验证集读取的个数
 ----------------
 :return val_loss         模型在验证集上的loss 
