@@ -99,6 +99,9 @@ def dist_train(gpu, args):
     epoch_run = args.epochs
     model_period = args.modelperiod
 
+    vib_period = args.vibperiod
+    vib_factor = args.vibfactor
+
     # 暂时没用
     dfdc_df_path = args.dfdc_faces_df_path
     dfdc_faces_dir = args.dfdc_faces_dir
@@ -296,8 +299,13 @@ def dist_train(gpu, args):
             optimizer.step()
             optimizer.zero_grad()
 
-            # *记录训练阶段数据，保存模型
-            if iteration > 0 and (iteration % log_interval == 0):
+            # *当达到周期时，选择震荡学习率，从而学习更优模型
+            if iteration > 10000 and iteration % vib_period == 0:
+                optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
+                    np.random.randint(0, vib_factor)
+
+            # *记录训练阶段数据，保存模型,制定由GPU0来完成此项任务
+            if iteration > 0 and (iteration % log_interval == 0) and gpu == 0:
                 train_loss /= train_num
                 tb.add_scalar('train/loss', train_loss, iteration)
                 tb.add_scalar('lr', optimizer.param_groups[0]['lr'], iteration)
@@ -305,10 +313,7 @@ def dist_train(gpu, args):
 
                 # *500个batch，会保存一次model
                 if (iteration % model_period == 0):
-                    # *当Loss小于某个阈值，且达到周期时，选择震荡学习率，从而学习更优模型
-                    if train_loss < 0.04 and iteration > 10000:
-                        optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
-                            np.random.randint(0, 10)
+
                     save_model_v2(model, optimizer, train_loss, val_loss,
                                   iteration, batch_size, epoch, periodic_path.format(iteration))
                     save_model_v2(model, optimizer, train_loss, val_loss,
@@ -332,8 +337,7 @@ def dist_train(gpu, args):
                                 train_pred, iteration)
 
                 # *Validation
-                # *将会在卡1 上进行模型验证
-                device = 1
+
                 val_loss = validation_routine(
                     model, val_loader, criterion, tb, iteration, 'val')
                 tb.flush()
@@ -391,6 +395,8 @@ def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch
 
 def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: str, mode: int, index: int):
     print("start loading model")
+    if not os.path.exists(path_list[mode]):
+        return 0, 0
     whole = torch.load(path_list[mode])
     # *加载模型参数
     incomp_keys = model.load_state_dict(
