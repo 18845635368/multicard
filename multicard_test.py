@@ -9,8 +9,11 @@ import os
 
 from datetime import datetime
 import argparse
+from posix import times_result
 
 from cv2 import stereoCalibrate
+from torchsummary.torchsummary import summary
+
 
 from isplutils.data import FrameFaceIterableDataset, FrameFaceDataset
 import torch.multiprocessing as mp
@@ -30,6 +33,8 @@ import numpy as np
 from sklearn.metrics import f1_score, roc_auc_score
 
 from config import config
+import time
+import models
 
 ###################
 # 分布式训练
@@ -115,19 +120,23 @@ def dist_train(gpu, args):
     # ?model = ConvNet()
 
     # *获取nodel_class,生成model
-    model_class = getattr(fornet, args.net)
-    model = model_class()
+    model_s_class = getattr(models, args.net_s)
+    model_t_class = getattr(fornet, args.net_t)
+
+    model_s = model_s_class()
+
+    model_t = model_t_class()
     transformer = utils.get_transformer(face_policy=face_policy, patch_size=face_size,
-                                        net_normalizer=model.get_normalizer(), train=True)
+                                        net_normalizer=model_s.get_normalizer(), train=True)
 
     # *生成model对应的tag
-    tag = utils.make_train_tag(net_class=model_class,
+    tag = utils.make_train_tag(net_class=model_s_class,
                                traindb=train_datasets,
                                face_policy=face_policy,
                                patch_size=face_size,
                                seed=seed,
                                debug=debug,
-                               note=''
+                               note='lr-1e-5 F3L'
                                )
 
     # *生成saved model的路径还有,生成文件夹
@@ -139,16 +148,16 @@ def dist_train(gpu, args):
 
     # !step3
     # *选择BCEWithLogits作为损失函数，并将其部署到GPU上
-    criterion = nn.BCEWithLogitsLoss().cuda(gpu)
+    # criterion = nn.BCEWithLogitsLoss().cuda(gpu)
     optimizer = torch.optim.Adam(
-        model.get_trainable_parameters(), lr=initial_lr)
+        model_s.get_trainable_parameters(), lr=initial_lr)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer=optimizer,
         mode='min',
         factor=0.1,
         patience=patience,
         cooldown=2 * patience,
-        min_lr=initial_lr*1e-5,
+        min_lr=initial_lr*1e-7,
     )
 
     # !step4
@@ -161,15 +170,21 @@ def dist_train(gpu, args):
     # *对模型进行加载
     # TODO 编写模型加载模块
 
-    epoch, iteration = load_model(model, optimizer, path_list, mode,
+    epoch, iteration = load_model(model_s, optimizer, path_list, mode,
                                   initial_model)
+    load_model(model_t, optimizer, [
+               "/mnt/8T/hou/multicard/weights/binclass/net-EfficientNetB4_traindb-ff-c23-720-140-140_face-scale_size-224_seed-3_note-/bestval.pth"], 0, initial_model, flag_t=True)
 
     print(epoch)
 
-    model = model.cuda(gpu)
+    model_s = model_s.cuda(gpu)
+    model_t = model_t.cuda(gpu)
 
-    model = nn.parallel.DistributedDataParallel(
-        model, device_ids=[gpu])
+    model_s = nn.parallel.DistributedDataParallel(
+        model_s, device_ids=[gpu], find_unused_parameters=True)
+
+    model_t = nn.parallel.DistributedDataParallel(
+        model_t, device_ids=[gpu], find_unused_parameters=True)
 
     # 将所有optimizer的数据放回到cuda上
     for state in optimizer.state.values():
@@ -180,11 +195,11 @@ def dist_train(gpu, args):
     # !step5
     # *生成数据增强用到的transform
 
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+    # model = nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
 
     # *同步batch归一化
     if args.syncbn:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model_s = nn.SyncBatchNorm.convert_sync_batchnorm(model_s)
         if gpu == 0:
             print('Use SyncBN in training')
     torch.cuda.set_device(gpu)
@@ -256,7 +271,7 @@ def dist_train(gpu, args):
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                batch_size=batch_size,
                                                shuffle=False,
-                                               num_workers=4,
+                                               num_workers=num_workers,
                                                pin_memory=True,
                                                sampler=train_sampler)
     val_loader = torch.utils.data.DataLoader(
@@ -268,7 +283,8 @@ def dist_train(gpu, args):
         # *若是一开始训练，log已经存在，将其删掉
         shutil.rmtree(logdir, ignore_errors=True)
     tb = SummaryWriter(logdir=logdir)
-
+    # print(model_s)
+    # summary(model_s.module, (3, 224, 224))
     # !step 8
     while epoch != epoch_run:
         # ?optimizer.zero_grad()
@@ -276,17 +292,24 @@ def dist_train(gpu, args):
         train_loss = train_num = 0
         train_pred_list = []
         train_labels_list = []
-        for train_batch in tqdm(train_loader, desc='Epoch {:03d}'.format(epoch), leave=False,
+        current = time.time()
+        train_batch_loss = 0
+        for train_batch in tqdm(train_loader, desc='Epoch {:03d} '.format(epoch), leave=False,
                                 total=len(train_loader)):
-            model.train()
+            model_s.train()
+            model_t.eval()
             batch_data, batch_labels = train_batch
             train_batch_num = len(batch_labels)
             # *param train_num 用于统计训练总数
             train_num += train_batch_num
             train_labels_list.append(batch_labels.numpy().flatten())
 
+            start = time.time()
+            # print(start-current)
+
             train_batch_loss, train_batch_pred = batch_forward(
-                model, criterion, batch_data, batch_labels)
+                model_s, model_t, batch_data, batch_labels, iteration, tb, flag=True)
+            # print(time.time()-start)
             train_pred_list.append(train_batch_pred.flatten())
 
             if torch.isnan(train_batch_loss):
@@ -299,10 +322,10 @@ def dist_train(gpu, args):
             optimizer.step()
             optimizer.zero_grad()
 
-            # *当达到周期时，选择震荡学习率，从而学习更优模型
-            if iteration > 10000 and (iteration % vib_period) == 0:
-                optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
-                    np.random.randint(2, vib_factor)
+            # # *当达到周期时，选择震荡学习率，从而学习更优模型
+            # if iteration > 10000 and (iteration % vib_period) == 0:
+            #     optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * \
+            #         np.random.randint(2, vib_factor)
 
             # *记录训练阶段数据，保存模型
             if iteration > 0 and (iteration % log_interval == 0):
@@ -319,9 +342,9 @@ def dist_train(gpu, args):
                 # *500个batch，会保存一次model
                 if (iteration % model_period == 0):
 
-                    save_model_v2(model, optimizer, train_loss, val_loss,
+                    save_model_v2(model_s, optimizer, train_loss, val_loss,
                                   iteration, batch_size, epoch, periodic_path.format(iteration))
-                    save_model_v2(model, optimizer, train_loss, val_loss,
+                    save_model_v2(model_s, optimizer, train_loss, val_loss,
                                   iteration, batch_size, epoch, last_path)
 
                 train_loss = train_num = 0
@@ -346,7 +369,7 @@ def dist_train(gpu, args):
                 # *Validation
 
                 val_loss = validation_routine(
-                    model, val_loader, criterion, tb, iteration, 'val')
+                    model_s, model_t, val_loader, tb, iteration, 'val')
                 tb.flush()
 
                 # *根据loss调整
@@ -355,10 +378,11 @@ def dist_train(gpu, args):
                 # Model checkpoint
                 if val_loss < min_val_loss:
                     min_val_loss = val_loss
-                    save_model_v2(model, optimizer, train_loss, val_loss,
+                    save_model_v2(model_s, optimizer, train_loss, val_loss,
                                   iteration, batch_size, epoch, bestval_path)
             # *每迭代一个batch +1
             iteration = iteration + 1
+            # current = time.time()
         epoch = epoch + 1
 
 
@@ -376,14 +400,19 @@ method definition:
 '''
 
 
-def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch.Tensor):
+def batch_forward(model: nn.Module, model_t: nn.Module, data: torch.Tensor, labels: torch.Tensor, iteration, tb, flag=False):
     data = data.cuda(non_blocking=True)
     labels = labels.cuda(non_blocking=True)
-    outputs = model(data)
-    # 将网络的输出转化为[0,1]，同时转为nadarray
-    pred = torch.sigmoid(outputs).detach().cpu().numpy()
-    # 计算Loss
-    loss = criterion(outputs, labels)
+    pred, w = model(data)
+    t_out = model_t(data)
+    # t_out = torch.sigmoid(t_out)
+    # # # 将网络的输出转化为[0,1]，同时转为nadarray
+    # pred = pred.detach().cpu().numpy()
+    # t_out = t_out.detach().cpu().numpy()
+    # # 计算Loss
+    # loss = criterion(outputs, labels)
+    loss = Loss_cal(pred, t_out, w, labels, iteration, tb, flag)
+    pred = pred.detach().cpu().numpy()
     return loss, pred
 
 
@@ -400,10 +429,19 @@ def batch_forward(model: nn.Module, criterion, data: torch.Tensor, labels: torch
 # TODO 维修现场
 
 
-def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: str, mode: int, index: int):
-    print("start loading model")
+def load_model(model: nn.Module, optimizer: torch.optim.Optimizer, path_list: str, mode: int, index: int, flag_t=False):
     if not os.path.exists(path_list[mode]):
         return 0, 0
+
+    if flag_t:
+        print("loading teacher model")
+        whole = torch.load(path_list[mode])
+        incomp_keys = model.load_state_dict(
+            {k.replace('module.', ''): v for k, v in whole['model'].items()})
+        print(incomp_keys)
+        return
+    print("loading student model")
+
     whole = torch.load(path_list[mode])
     # *加载模型参数
     incomp_keys = model.load_state_dict(
@@ -509,7 +547,7 @@ method definition:
 '''
 
 
-def validation_routine(net, val_loader, criterion, tb, iteration, tag: str, loader_len_norm: int = None):
+def validation_routine(net, net_t, val_loader, tb, iteration, tag: str, loader_len_norm: int = None):
     # switch to eval mode
     net.eval()
 
@@ -525,8 +563,8 @@ def validation_routine(net, val_loader, criterion, tb, iteration, tag: str, load
         val_batch_num = len(batch_labels)
         labels_list.append(batch_labels.flatten())
         with torch.no_grad():
-            val_batch_loss, val_batch_pred = batch_forward(net, criterion, batch_data,
-                                                           batch_labels)
+            val_batch_loss, val_batch_pred = batch_forward(net, net_t, batch_data,
+                                                           batch_labels, iteration, tb)
         pred_list.append(val_batch_pred.flatten())
         val_num += val_batch_num
         val_loss += val_batch_loss.item() * val_batch_num
@@ -535,16 +573,67 @@ def validation_routine(net, val_loader, criterion, tb, iteration, tag: str, load
     val_loss /= val_num
     tb.add_scalar('{}/loss'.format(tag), val_loss, iteration)
 
-    if isinstance(criterion, nn.BCEWithLogitsLoss):
-        val_labels = np.concatenate(labels_list)
-        val_pred = np.concatenate(pred_list)
-        val_roc_auc = roc_auc_score(val_labels, val_pred)
-        #val_f1 = f1_score(val_labels, val_pred)
-        tb.add_scalar('{}/roc_auc'.format(tag), val_roc_auc, iteration)
-        #tb.add_scalar('{}/f1'.format(tag), val_f1, iteration)
-        tb.add_pr_curve('{}/pr'.format(tag), val_labels, val_pred, iteration)
+    val_labels = np.concatenate(labels_list)
+    val_pred = np.concatenate(pred_list)
+    val_roc_auc = roc_auc_score(val_labels, val_pred)
+    #val_f1 = f1_score(val_labels, val_pred)
+    tb.add_scalar('{}/roc_auc'.format(tag), val_roc_auc, iteration)
+    #tb.add_scalar('{}/f1'.format(tag), val_f1, iteration)
+    tb.add_pr_curve('{}/pr'.format(tag), val_labels, val_pred, iteration)
 
     return val_loss
+
+
+def Loss_cal(outputs, outputs_t, w, labels, iteration, tb, flag=False, KD_T=10, KD_alpha=0.5):
+    # loss 1 BCE
+    loss1 = nn.BCEWithLogitsLoss()(outputs, labels)
+    # loss 2 KDLoss
+    # 相关loss，当BCE的值越小，越不需要依赖于老师
+    if iteration > 2000:
+        loss2 = 0
+    else:
+        loss2 = nn.KLDivLoss(reduction='batchmean')(nn.Softmax(
+            dim=0)(outputs/KD_T), nn.Softmax(dim=0)(outputs_t/KD_T) * KD_alpha*KD_T*KD_T)
+
+    while loss2 > loss1:
+        loss2 = loss2/2
+
+    # loss 3 EnergyLoss
+    w_mean = w.mean(dim=0)
+    loss3 = abs(w_mean[0:1396].mean()-(w_mean[1396:].mean()))*100
+    # loss 4 featureAttentionLoss
+    loss4 = featureAttentionLossCal(w)
+    loss = 0
+    if flag:
+        tb.add_scalar('train/loss1', loss1, iteration)
+        tb.add_scalar('train/loss2', loss2, iteration)
+        tb.add_scalar('train/loss3', loss3, iteration)
+        tb.add_scalar('train/loss4', loss4, iteration)
+    while loss3 > 1:
+        loss3 = loss3/10
+    while loss4 > 1:
+        loss4 = loss4/10
+    loss = loss1+loss2+loss3+loss4
+    if loss > 10:
+        print(loss)
+
+    loss = loss.cuda()
+    return loss
+
+
+def featureAttentionLossCal(w):
+    # 对前三个分类器不加约束
+    w = w[3:]
+    w_T = w.transpose(0, 1)
+    w_2 = torch.mm(w, w_T)
+    w_2diag = torch.diag(w_2)
+
+    ans = (46*sum(w_2diag) - sum(sum(w_2)))/45
+
+    # if(ans > 10):
+    #     print(ans)
+
+    return ans
 
 
 def main():
